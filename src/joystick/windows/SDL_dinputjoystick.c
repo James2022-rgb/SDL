@@ -226,6 +226,66 @@ const DIDATAFORMAT SDL_c_dfDIJoystick2 = {
     dfDIJoystick2
 };
 
+// Some devices report more than 2 sliders while `DIJOYSTATE2` only supports 2.
+//
+// An example is the HORI Truck Control System, which has 3 sliders where the vertical axis of the left analog stick is the third slider.
+// In this case `DIJOFS_SLIDER(2)` would alias `DIJOFS_POV(0)`.
+//
+// To support these devices, we define an extended state with extra sliders appended after `DIJOYSTATE2`.
+#define SDL_DINPUT_EXTRA_SLIDERS 1
+#define SDL_DINPUT_MAX_SLIDERS   (2 + SDL_DINPUT_EXTRA_SLIDERS)
+
+typedef struct SDL_DIJOYSTATE2EX
+{
+    DIJOYSTATE2 js;
+    LONG rglSliderExtra[SDL_DINPUT_EXTRA_SLIDERS];     // In addition to `DIJOYSTATE2::rglSlider[2]`
+} SDL_DIJOYSTATE2EX;
+
+#define SDL_DIJOFS_SLIDER(n)                                          \
+    (((n) < 2) ? (DWORD)DIJOFS_SLIDER(n)                              \
+               : (DWORD)(FIELD_OFFSET(SDL_DIJOYSTATE2EX, rglSliderExtra) + ((n) - 2) * sizeof(LONG)))
+
+static DIOBJECTDATAFORMAT dfSDLJoystick2Ex[SDL_arraysize(dfDIJoystick2) + SDL_DINPUT_EXTRA_SLIDERS];
+
+static const DIDATAFORMAT SDL_c_dfSDLJoystick2Ex = {
+    sizeof(DIDATAFORMAT),
+    sizeof(DIOBJECTDATAFORMAT),
+    DIDF_ABSAXIS,
+    sizeof(SDL_DIJOYSTATE2EX),
+    SDL_arraysize(dfSDLJoystick2Ex),
+    dfSDLJoystick2Ex
+};
+
+// Initialize `dfSDLJoystick2Ex` with the formats from `dfDIJoystick2` and extra position sliders for the extended state.
+static void InitExtendedDataFormat(void)
+{
+    static bool initialized = false;
+    size_t i, n = 0;
+
+    if (initialized) {
+        return;
+    }
+
+    for (i = 0; i < SDL_arraysize(dfDIJoystick2); ++i) {
+        const DIOBJECTDATAFORMAT *src = &dfDIJoystick2[i];
+
+        dfSDLJoystick2Ex[n++] = *src;
+        if (src->pguid == &GUID_Slider && src->dwOfs == DIJOFS_SLIDER(1) && src->dwFlags == DIDOI_ASPECTPOSITION) {
+            // DIJOFS_SLIDER(1) is the last of the two sliders supported by `DIJOYSTATE2`, so we insert the formats for our extra sliders after it.
+
+            int s;
+            for (s = 0; s < SDL_DINPUT_EXTRA_SLIDERS; ++s) {
+                dfSDLJoystick2Ex[n] = *src;
+                dfSDLJoystick2Ex[n].dwOfs = SDL_DIJOFS_SLIDER(2 + s);
+                ++n;
+            }
+        }
+    }
+    SDL_assert(n == SDL_arraysize(dfSDLJoystick2Ex));
+
+    initialized = true;
+}
+
 // Convert a DirectInput return code to a text message
 static bool SetDIerror(const char *function, HRESULT code)
 {
@@ -647,7 +707,11 @@ static BOOL CALLBACK EnumDevObjectsCallback(LPCDIDEVICEOBJECTINSTANCE pDeviceObj
         } else if (SDL_memcmp(&pDeviceObject->guidType, &GUID_RzAxis, sizeof(pDeviceObject->guidType)) == 0) {
             in->ofs = DIJOFS_RZ;
         } else if (SDL_memcmp(&pDeviceObject->guidType, &GUID_Slider, sizeof(pDeviceObject->guidType)) == 0) {
-            in->ofs = DIJOFS_SLIDER(joystick->hwdata->NumSliders);
+            // We ignore sliders we have no room for, otherwise their offset would alias a POV
+            if (joystick->hwdata->NumSliders >= SDL_DINPUT_MAX_SLIDERS) {
+                return DIENUM_CONTINUE;
+            }
+            in->ofs = SDL_DIJOFS_SLIDER(joystick->hwdata->NumSliders);
             ++joystick->hwdata->NumSliders;
         } else {
             return DIENUM_CONTINUE; // not an axis we can grok
@@ -774,10 +838,11 @@ bool SDL_DINPUT_JoystickOpen(SDL_Joystick *joystick, JoyStick_DeviceData *joysti
         return SetDIerror("IDirectInputDevice8::SetCooperativeLevel", result);
     }
 
-    // Use the extended data structure: DIJOYSTATE2.
+    // Use our extended data structure so we can support more sliders than `DIJOYSTATE2` supports.
+    InitExtendedDataFormat();
     result =
         IDirectInputDevice8_SetDataFormat(joystick->hwdata->InputDevice,
-                                          &SDL_c_dfDIJoystick2);
+                                          &SDL_c_dfSDLJoystick2Ex);
     if (FAILED(result)) {
         return SetDIerror("IDirectInputDevice8::SetDataFormat", result);
     }
@@ -989,19 +1054,19 @@ static Uint8 TranslatePOV(DWORD value)
  */
 static void UpdateDINPUTJoystickState_Polled(SDL_Joystick *joystick)
 {
-    DIJOYSTATE2 state;
+    SDL_DIJOYSTATE2EX state;
     HRESULT result;
     int i;
     Uint64 timestamp = SDL_GetTicksNS();
 
     result =
         IDirectInputDevice8_GetDeviceState(joystick->hwdata->InputDevice,
-                                           sizeof(DIJOYSTATE2), &state);
+                                           sizeof(state), &state);
     if (result == DIERR_INPUTLOST || result == DIERR_NOTACQUIRED) {
         IDirectInputDevice8_Acquire(joystick->hwdata->InputDevice);
         result =
             IDirectInputDevice8_GetDeviceState(joystick->hwdata->InputDevice,
-                                               sizeof(DIJOYSTATE2), &state);
+                                               sizeof(state), &state);
     }
 
     if (result != DI_OK) {
@@ -1016,39 +1081,45 @@ static void UpdateDINPUTJoystickState_Polled(SDL_Joystick *joystick)
         case AXIS:
             switch (in->ofs) {
             case DIJOFS_X:
-                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.lX);
+                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.js.lX);
                 break;
             case DIJOFS_Y:
-                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.lY);
+                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.js.lY);
                 break;
             case DIJOFS_Z:
-                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.lZ);
+                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.js.lZ);
                 break;
             case DIJOFS_RX:
-                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.lRx);
+                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.js.lRx);
                 break;
             case DIJOFS_RY:
-                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.lRy);
+                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.js.lRy);
                 break;
             case DIJOFS_RZ:
-                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.lRz);
+                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.js.lRz);
                 break;
             case DIJOFS_SLIDER(0):
-                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.rglSlider[0]);
+                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.js.rglSlider[0]);
                 break;
             case DIJOFS_SLIDER(1):
-                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.rglSlider[1]);
+                SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.js.rglSlider[1]);
+                break;
+            default:
+                if (in->ofs >= SDL_DIJOFS_SLIDER(2) && in->ofs < SDL_DIJOFS_SLIDER(SDL_DINPUT_MAX_SLIDERS)) {
+                    const DWORD extra_slider = (in->ofs - SDL_DIJOFS_SLIDER(2)) / sizeof(LONG);
+                    SDL_SendJoystickAxis(timestamp, joystick, in->num, (Sint16)state.rglSliderExtra[extra_slider]);
+                }
                 break;
             }
             break;
 
         case BUTTON:
             SDL_SendJoystickButton(timestamp, joystick, in->num,
-                                      (state.rgbButtons[in->ofs - DIJOFS_BUTTON0] != 0));
+                                      (state.js.rgbButtons[in->ofs - DIJOFS_BUTTON0] != 0));
             break;
         case HAT:
         {
-            Uint8 pos = TranslatePOV(state.rgdwPOV[in->num]);
+            Uint8 pos = TranslatePOV(state.js.rgdwPOV[in->num]);
             SDL_SendJoystickHat(timestamp, joystick, in->num, pos);
             break;
         }
